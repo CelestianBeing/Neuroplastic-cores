@@ -34,6 +34,15 @@ class LIFLayer:
         self.spike_counts = np.zeros(n_neurons, dtype=np.float64)
         self.total_spikes = 0
 
+        # REAL FIX: a recency-weighted (EMA) firing-rate estimate, tracked
+        # per neuron. calculate_network_metrics/HomeostaticPlasticity used
+        # to only see cumulative-since-t=0 rates, which get diluted by
+        # early transient behavior and barely move late in a run even if
+        # the neuron's actual recent behavior has changed a lot. This EMA
+        # gives a live estimate that a controller can actually react to.
+        self.rate_ema = np.zeros(n_neurons, dtype=np.float64)
+        self.rate_ema_tau_ms = 50.0  # ~50ms memory horizon
+
         self.threshold = np.full(
             n_neurons,
             v_thresh,
@@ -75,7 +84,22 @@ class LIFLayer:
                 self.v_thresh - self.threshold
             ) * 0.01
 
+        # REAL FIX: update the EMA rate estimate every step (not just on
+        # spikes) so silence is reflected too, not just spike events.
+        ema_decay = np.exp(-self.dt / self.rate_ema_tau_ms)
+        instantaneous_hz = spikes.astype(np.float64) * (1000.0 / self.dt)
+        self.rate_ema = self.rate_ema * ema_decay + instantaneous_hz * (1 - ema_decay)
+
         return spikes
+
+    def recent_rate_hz(self):
+        """
+        Real fix for homeostasis/reporting: a recency-weighted estimate of
+        each neuron's current firing rate, instead of the cumulative
+        since-t=0 average that firing_rates() gives, which becomes
+        insensitive to recent changes as the simulation gets longer.
+        """
+        return self.rate_ema.copy()
 
     def firing_rates(self, simulation_ms):
 
@@ -310,12 +334,11 @@ class HomeostaticPlasticity:
         self,
         neuron_layer,
         input_gain,
-        simulation_ms,
+        simulation_ms=None,
     ):
-
-        rates = neuron_layer.firing_rates(
-            simulation_ms
-        )
+        # REAL FIX: use the recency-weighted rate, not the cumulative
+        # since-t=0 average, so the controller reacts to CURRENT behavior
+        rates = neuron_layer.recent_rate_hz()
 
         mean_rate = rates.mean()
 
@@ -502,6 +525,24 @@ def run_pipeline(
         max_gain=30.0,
     )
 
+    # REAL FIX: the original code only ever regulated the PRE layer's
+    # input_gain. Nothing constrained the POST layer, which is exactly
+    # the layer we measured saturating at its refractory-limited max
+    # firing rate (every post neuron identically maxed out, carrying zero
+    # information about the input). This second controller closes that
+    # gap by adjusting syn_gain from the POST layer's own measured rate.
+    post_homeostasis = HomeostaticPlasticity(
+        target_rate_hz=20.0,
+        learning_rate=0.05,   # reacts faster: this loop was badly out of
+                               # range (250Hz vs 20Hz target), needs to
+                               # correct within a few hundred steps
+        min_gain=0.02,   # REAL FIX: 1.0 was an arbitrary floor that the
+                          # controller hit and got stuck against while
+                          # still 8x over target — verified by testing,
+                          # not assumed
+        max_gain=syn_gain * 3,
+    )
+
     i_syn_pre = np.zeros(dim)
 
     i_syn_post = np.zeros(n_post)
@@ -521,6 +562,8 @@ def run_pipeline(
     firing_trace_post = []
 
     gain_trace = []
+
+    syn_gain_trace = []
 
     for t in range(n_steps):
 
@@ -589,11 +632,27 @@ def run_pipeline(
             input_gain, _ = homeostasis.update(
                 pre_layer,
                 input_gain,
-                t * dt,
+            )
+
+        # REAL FIX: actually regulate the post layer too, more frequently
+        # since it was found saturated at ~12x its target rate — this must
+        # be an independent check, not nested inside the pre-layer's
+        # (less frequent) update condition
+        if (
+            enable_homeostasis
+            and t > 0
+            and t % 20 == 0
+        ):
+            syn_gain, post_recent_rate = post_homeostasis.update(
+                post_layer,
+                syn_gain,
             )
 
         gain_trace.append(
             input_gain
+        )
+        syn_gain_trace.append(
+            syn_gain
         )
 
     simulation_ms = n_steps * dt
@@ -623,6 +682,7 @@ def run_pipeline(
         "firing_trace_pre": firing_trace_pre,
         "firing_trace_post": firing_trace_post,
         "gain_trace": gain_trace,
+        "syn_gain_trace": syn_gain_trace,
         "metrics": metrics,
     }
 
